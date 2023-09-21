@@ -1,251 +1,27 @@
 import os
 import json
-import hashlib
 import torch
 import numpy as np
-from typing import Dict, List, Tuple
-from PIL import Image
+import hashlib
+from typing import List
+from torch import Tensor
+from PIL import Image, ImageSequence
 from PIL.PngImagePlugin import PngInfo
-from einops import rearrange
 
 import folder_paths
-import comfy.ldm.modules.diffusionmodules.openaimodel as openaimodel
-import comfy.model_management as model_management
-from comfy.ldm.modules.attention import SpatialTransformer
-from comfy.ldm.modules.diffusionmodules.util import GroupNorm32
-from comfy.utils import load_torch_file, calculate_parameters
-from comfy.model_patcher import ModelPatcher
 
-from .logger import logger
-from .motion_module import MotionWrapper, VanillaTemporalModule
-from .model_utils import MODEL_DIR, get_available_models
+from .model_utils import get_available_models, load_motion_module
+from .utils import pil2tensor
+from .sampler import AnimateDiffSampler, AnimateDiffSlidingWindowOptions
 
 
-orig_forward_timestep_embed = openaimodel.forward_timestep_embed
-groupnorm32_original_forward = GroupNorm32.forward
+SLIDING_CONTEXT_LENGTH = 16
+
+video_formats_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "video_formats")
+video_formats = ["video/" + x[:-5] for x in os.listdir(video_formats_dir)]
 
 
-def forward_timestep_embed(
-    ts, x, emb, context=None, transformer_options={}, output_shape=None
-):
-    for layer in ts:
-        if isinstance(layer, openaimodel.TimestepBlock):
-            x = layer(x, emb)
-        elif isinstance(layer, VanillaTemporalModule):
-            x = layer(x, context)
-        elif isinstance(layer, SpatialTransformer):
-            x = layer(x, context, transformer_options)
-            transformer_options["current_index"] += 1
-        elif isinstance(layer, openaimodel.Upsample):
-            x = layer(x, output_shape=output_shape)
-        else:
-            x = layer(x)
-    return x
-
-
-def groupnorm32_mm_forward(self, x):
-    x = rearrange(x, "(b f) c h w -> b c f h w", b=2)
-    x = groupnorm32_original_forward(self, x)
-    x = rearrange(x, "b c f h w -> (b f) c h w", b=2)
-    return x
-
-
-openaimodel.forward_timestep_embed = forward_timestep_embed
-
-motion_modules: Dict[str, MotionWrapper] = {}
-original_model_hashs = set()
-injected_model_hashs: Dict[str, Tuple[str, str]] = {}
-
-
-def calculate_model_hash(unet):
-    t = unet.input_blocks[1]
-    m = hashlib.sha256()
-    for buf in t.buffers():
-        m.update(buf.cpu().numpy().view(np.uint8))
-    return m.hexdigest()
-
-
-def load_motion_module(model_name: str):
-    model_path = os.path.join(MODEL_DIR, model_name)
-
-    logger.info(f"Loading motion module {model_name}")
-    mm_state_dict = load_torch_file(model_path)
-    motion_module = MotionWrapper(model_name)
-
-    parameters = calculate_parameters(mm_state_dict, "")
-    usefp16 = model_management.should_use_fp16(model_params=parameters)
-    if usefp16:
-        logger.info("Using fp16, converting motion module to fp16")
-        motion_module.half()
-    offload_device = model_management.unet_offload_device()
-    motion_module = motion_module.to(offload_device)
-    motion_module.load_state_dict(mm_state_dict)
-
-    return motion_module
-
-
-def inject_motion_module_to_unet_legacy(unet, motion_module: MotionWrapper):
-    logger.info(f"Injecting motion module into UNet input blocks.")
-    for mm_idx, unet_idx in enumerate([1, 2, 4, 5, 7, 8, 10, 11]):
-        mm_idx0, mm_idx1 = mm_idx // 2, mm_idx % 2
-        unet.input_blocks[unet_idx].append(
-            motion_module.down_blocks[mm_idx0].motion_modules[mm_idx1]
-        )
-
-    logger.info(f"Injecting motion module into UNet output blocks.")
-    for unet_idx in range(12):
-        mm_idx0, mm_idx1 = unet_idx // 3, unet_idx % 3
-        if unet_idx % 2 == 2:
-            unet.output_blocks[unet_idx].insert(
-                -1, motion_module.up_blocks[mm_idx0].motion_modules[mm_idx1]
-            )
-        else:
-            unet.output_blocks[unet_idx].append(
-                motion_module.up_blocks[mm_idx0].motion_modules[mm_idx1]
-            )
-
-
-def eject_motion_module_from_unet_legacy(unet):
-    logger.info(f"Ejecting motion module from UNet input blocks.")
-    for unet_idx in [1, 2, 4, 5, 7, 8, 10, 11]:
-        unet.input_blocks[unet_idx].pop(-1)
-
-    logger.info(f"Ejecting motion module from UNet output blocks.")
-    for unet_idx in range(12):
-        if unet_idx % 2 == 2:
-            unet.output_blocks[unet_idx].pop(-2)
-        else:
-            unet.output_blocks[unet_idx].pop(-1)
-
-
-def inject_motion_module_to_unet(unet, motion_module: MotionWrapper):
-    logger.info(f"Injecting motion module into UNet input blocks.")
-    for mm_idx, unet_idx in enumerate([1, 2, 4, 5, 7, 8, 10, 11]):
-        mm_idx0, mm_idx1 = mm_idx // 2, mm_idx % 2
-        unet.input_blocks[unet_idx].append(
-            motion_module.down_blocks[mm_idx0].motion_modules[mm_idx1]
-        )
-
-    logger.info(f"Injecting motion module into UNet output blocks.")
-    for unet_idx in range(12):
-        mm_idx0, mm_idx1 = unet_idx // 3, unet_idx % 3
-        if unet_idx % 3 == 2 and unet_idx != 11:
-            unet.output_blocks[unet_idx].insert(
-                -1, motion_module.up_blocks[mm_idx0].motion_modules[mm_idx1]
-            )
-        else:
-            unet.output_blocks[unet_idx].append(
-                motion_module.up_blocks[mm_idx0].motion_modules[mm_idx1]
-            )
-
-
-def eject_motion_module_from_unet(unet):
-    logger.info(f"Ejecting motion module from UNet input blocks.")
-    for unet_idx in [1, 2, 4, 5, 7, 8, 10, 11]:
-        unet.input_blocks[unet_idx].pop(-1)
-
-    logger.info(f"Ejecting motion module from UNet output blocks.")
-    for unet_idx in range(12):
-        if unet_idx % 3 == 2 and unet_idx != 11:
-            unet.output_blocks[unet_idx].pop(-2)
-        else:
-            unet.output_blocks[unet_idx].pop(-1)
-
-
-injectors = {
-    "legacy": inject_motion_module_to_unet_legacy,
-    "v1": inject_motion_module_to_unet,
-}
-
-ejectors = {
-    "legacy": eject_motion_module_from_unet_legacy,
-    "v1": eject_motion_module_from_unet,
-}
-
-
-class AnimateDiffLoaderLegacy:
-    def __init__(self) -> None:
-        self.version = "legacy"
-
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "model": ("MODEL",),
-                "model_name": (get_available_models(),),
-                "width": ("INT", {"default": 512, "min": 64, "max": 1024, "step": 8}),
-                "height": ("INT", {"default": 512, "min": 64, "max": 1024, "step": 8}),
-                "frame_number": (
-                    "INT",
-                    {"default": 16, "min": 2, "max": 24, "step": 1},
-                ),
-            },
-            "optional": {
-                "init_latent": ("LATENT",),
-            },
-        }
-
-    @classmethod
-    def IS_CHANGED(s, model: ModelPatcher):
-        unet = model.model.diffusion_model
-        return calculate_model_hash(unet) not in injected_model_hashs
-
-    RETURN_TYPES = ("MODEL", "LATENT")
-    CATEGORY = "Animate Diff"
-    FUNCTION = "inject_motion_modules"
-
-    def inject_motion_modules(
-        self,
-        model: ModelPatcher,
-        model_name: str,
-        width: int,
-        height: int,
-        frame_number=16,
-        init_latent: Dict[str, torch.Tensor] = None,
-    ):
-        model = model.clone()
-
-        if model_name not in motion_modules:
-            motion_modules[model_name] = load_motion_module(model_name)
-
-        motion_module = motion_modules[model_name]
-        unet = model.model.diffusion_model
-        unet_hash = calculate_model_hash(unet)
-
-        need_inject = unet_hash not in injected_model_hashs
-
-        if unet_hash in injected_model_hashs:
-            (mm_type, version) = injected_model_hashs[unet_hash]
-            if version != self.version or mm_type != motion_module.mm_type:
-                # injected by another motion module, unload first
-                logger.info(f"Ejecting motion module {mm_type} version {version}.")
-                ejectors[version](unet)
-                GroupNorm32.forward = groupnorm32_original_forward
-                need_inject = True
-            else:
-                logger.info(f"Motion module already injected, skipping injection.")
-
-        if need_inject:
-            logger.info(f"Injecting motion module {model_name} version {self.version}.")
-            injectors[self.version](unet, motion_module)
-            unet_hash = calculate_model_hash(unet)
-            injected_model_hashs[unet_hash] = (motion_module.mm_type, self.version)
-
-            logger.info(f"Hacking GroupNorm32 forward function.")
-            GroupNorm32.forward = groupnorm32_mm_forward
-
-        if init_latent is None:
-            latent = torch.zeros([frame_number, 4, height // 8, width // 8]).cpu()
-        else:
-            # clone value of first frame
-            latent = init_latent["samples"][:1, :, :, :].clone().cpu()
-            # repeat for all frames
-            latent = latent.repeat(frame_number, 1, 1, 1)
-
-        return (model, {"samples": latent})
-
-
-class MotionModuleLoader:
+class AnimateDiffModuleLoader:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -262,114 +38,9 @@ class MotionModuleLoader:
         self,
         model_name: str,
     ):
-        if not model_name in motion_modules is None:
-            motion_modules[model_name] = load_motion_module(model_name)
+        motion_module = load_motion_module(model_name)
 
-        return (motion_modules[model_name],)
-
-
-class AnimateDiffLoader:
-    def __init__(self) -> None:
-        self.version = "v1"
-
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "model": ("MODEL",),
-                "init_latent": ("LATENT",),
-                "model_name": (get_available_models(),),
-                "frame_number": (
-                    "INT",
-                    {"default": 16, "min": 2, "max": 24, "step": 1},
-                ),
-            },
-        }
-
-    @classmethod
-    def IS_CHANGED(s, model: ModelPatcher, _):
-        unet = model.model.diffusion_model
-        return calculate_model_hash(unet) not in injected_model_hashs
-
-    RETURN_TYPES = ("MODEL", "LATENT")
-    CATEGORY = "Animate Diff"
-    FUNCTION = "inject_motion_modules"
-
-    def inject_motion_modules(
-        self,
-        model: ModelPatcher,
-        init_latent: Dict[str, torch.Tensor],
-        model_name: str,
-        frame_number=16,
-    ):
-        if model_name not in motion_modules:
-            motion_modules[model_name] = load_motion_module(model_name)
-
-        motion_module = motion_modules[model_name]
-
-        model = model.clone()
-        unet = model.model.diffusion_model
-        unet_hash = calculate_model_hash(unet)
-        need_inject = unet_hash not in injected_model_hashs
-
-        if unet_hash in injected_model_hashs:
-            (mm_type, version) = injected_model_hashs[unet_hash]
-            if version != self.version or mm_type != motion_module.mm_type:
-                # injected by another motion module, unload first
-                logger.info(f"Ejecting motion module {mm_type} version {version}.")
-                ejectors[version](unet)
-                GroupNorm32.forward = groupnorm32_original_forward
-                need_inject = True
-            else:
-                logger.info(f"Motion module already injected, skipping injection.")
-
-        if need_inject:
-            logger.info(f"Injecting motion module {model_name} version {self.version}.")
-            injectors[self.version](unet, motion_module)
-            unet_hash = calculate_model_hash(unet)
-            injected_model_hashs[unet_hash] = (motion_module.mm_type, self.version)
-
-            logger.info(f"Hacking GroupNorm32 forward function.")
-            GroupNorm32.forward = groupnorm32_mm_forward
-        
-        init_frames = len(init_latent["samples"])
-        samples = init_latent["samples"][:init_frames, :, :, :].clone().cpu()
-        
-        if init_frames < frame_number:
-            last_frame = samples[-1].unsqueeze(0)
-            repeated_last_frames = last_frame.repeat(frame_number - init_frames, 1, 1, 1)
-            samples = torch.cat((samples, repeated_last_frames), dim=0)
-
-        return (model, {"samples": samples})
-
-
-class AnimateDiffUnload:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {"required": {"model": ("MODEL",)}}
-
-    @classmethod
-    def IS_CHANGED(s, model: ModelPatcher):
-        unet = model.model.diffusion_model
-        return calculate_model_hash(unet) in injected_model_hashs
-
-    RETURN_TYPES = ("MODEL",)
-    CATEGORY = "Animate Diff"
-    FUNCTION = "unload_motion_modules"
-
-    def unload_motion_modules(self, model: ModelPatcher):
-        model = model.clone()
-        unet = model.model.diffusion_model
-        model_hash = calculate_model_hash(unet)
-        if model_hash in injected_model_hashs:
-            (model_name, version) = injected_model_hashs[model_hash]
-            logger.info(f"Ejecting motion module {model_name} version {version}.")
-            ejectors[version](unet)
-            GroupNorm32.forward = groupnorm32_original_forward
-        else:
-            logger.info(f"Motion module not injected, skip unloading.")
-
-        return (model,)
+        return (motion_module,)
 
 
 class AnimateDiffCombine:
@@ -383,8 +54,10 @@ class AnimateDiffCombine:
                     {"default": 8, "min": 1, "max": 24, "step": 1},
                 ),
                 "loop_count": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
-                "save_image": (["Enabled", "Disabled"],),
-                "filename_prefix": ("STRING", {"default": "AnimateDiff"}),
+                "save_image": ("BOOLEAN", {"default": True}),
+                "filename_prefix": ("STRING", {"default": "animate_diff"}),
+                "format": (["image/gif", "image/webp"] + video_formats,),
+                "pingpong": ("BOOLEAN", {"default": False}),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -402,24 +75,22 @@ class AnimateDiffCombine:
         images,
         frame_rate: int,
         loop_count: int,
-        save_image="Enabled",
+        save_image=True,
         filename_prefix="AnimateDiff",
+        format="image/gif",
+        pingpong=False,
         prompt=None,
         extra_pnginfo=None,
     ):
         # convert images to numpy
-        pil_images: List[Image.Image] = []
+        frames: List[Image.Image] = []
         for image in images:
             img = 255.0 * image.cpu().numpy()
             img = Image.fromarray(np.clip(img, 0, 255).astype(np.uint8))
-            pil_images.append(img)
+            frames.append(img)
 
         # save image
-        output_dir = (
-            folder_paths.get_output_directory()
-            if save_image == "Enabled"
-            else folder_paths.get_temp_directory()
-        )
+        output_dir = folder_paths.get_output_directory() if save_image else folder_paths.get_temp_directory()
         (
             full_output_folder,
             filename,
@@ -438,45 +109,231 @@ class AnimateDiffCombine:
         # save first frame as png to keep metadata
         file = f"{filename}_{counter:05}_.png"
         file_path = os.path.join(full_output_folder, file)
-        pil_images[0].save(
+        frames[0].save(
             file_path,
             pnginfo=metadata,
             compress_level=4,
         )
+        if pingpong:
+            frames = frames + frames[-2:0:-1]
 
-        # save gif
-        file = f"{filename}_{counter:05}_.gif"
-        file_path = os.path.join(full_output_folder, file)
-        pil_images[0].save(
-            file_path,
-            save_all=True,
-            append_images=pil_images[1:],
-            duration=round(1000 / frame_rate),
-            loop=loop_count,
-            compress_level=4,
-        )
+        format_type, format_ext = format.split("/")
 
-        print("Saved gif to", file_path, os.path.exists(file_path))
+        if format_type == "image":
+            file = f"{filename}_{counter:05}_.{format_ext}"
+            file_path = os.path.join(full_output_folder, file)
+            frames[0].save(
+                file_path,
+                format=format_ext.upper(),
+                save_all=True,
+                append_images=frames[1:],
+                duration=round(1000 / frame_rate),
+                loop=loop_count,
+                compress_level=4,
+            )
+        else:
+            # save webm
+            import shutil
+            import subprocess
+
+            ffmpeg_path = shutil.which("ffmpeg")
+            if ffmpeg_path is None:
+                raise ProcessLookupError("Could not find ffmpeg")
+            video_format_path = os.path.join(video_formats_dir, format_ext + ".json")
+            with open(video_format_path, "r") as stream:
+                video_format = json.load(stream)
+            file = f"{filename}_{counter:05}_.{video_format['extension']}"
+            file_path = os.path.join(full_output_folder, file)
+            dimensions = f"{frames[0].width}x{frames[0].height}"
+            args = (
+                [
+                    ffmpeg_path,
+                    "-v",
+                    "error",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgb24",
+                    "-s",
+                    dimensions,
+                    "-r",
+                    str(frame_rate),
+                    "-i",
+                    "-",
+                ]
+                + video_format["main_pass"]
+                + [file_path]
+            )
+
+            env = os.environ
+            if "environment" in video_format:
+                env.update(video_format["environment"])
+            with subprocess.Popen(args, stdin=subprocess.PIPE, env=env) as proc:
+                for frame in frames:
+                    proc.stdin.write(frame.tobytes())
 
         previews = [
             {
                 "filename": file,
                 "subfolder": subfolder,
-                "type": "output" if save_image == "Enabled" else "temp",
+                "type": "output" if save_image else "temp",
+                "format": format,
             }
         ]
-        return {"ui": {"images": previews}}
+        return {"ui": {"videos": previews}}
+
+
+class LoadVideo:
+    @classmethod
+    def INPUT_TYPES(s):
+        input_dir = os.path.join(folder_paths.get_input_directory(), "video")
+        if not os.path.exists(input_dir):
+            os.makedirs(input_dir, exist_ok=True)
+
+        files = [f"video/{f}" for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+
+        return {
+            "required": {
+                "video": (sorted(files), {"video_upload": True}),
+            },
+            "optional": {
+                "frame_start": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFF, "step": 1}),
+                "frame_limit": ("INT", {"default": 16, "min": 1, "max": 10240, "step": 1}),
+            },
+        }
+
+    CATEGORY = "Animate Diff/Utils"
+    RETURN_TYPES = ("IMAGE", "INT")
+    RETURN_NAMES = ("frames", "frame_count")
+    FUNCTION = "load"
+
+    def load_gif(self, gif_path: str, frame_start: int, frame_limit: int):
+        image = Image.open(gif_path)
+        frames = []
+
+        for i, frame in enumerate(ImageSequence.Iterator(image)):
+            if i < frame_start:
+                continue
+            elif i >= frame_start + frame_limit:
+                break
+            else:
+                frames.append(pil2tensor(frame.copy().convert("RGB")))
+
+        return frames
+
+    def load_video(self, video_path, frame_start: int, frame_limit: int):
+        import cv2
+
+        video = cv2.VideoCapture(video_path)
+        video.set(cv2.CAP_PROP_POS_FRAMES, frame_start)
+
+        frames = []
+        for i in range(frame_limit):
+            # Read the next frame
+            ret, frame = video.read()
+            if ret:
+                # Convert the frame to RGB (OpenCV uses BGR)
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # Convert the NumPy array to a PIL image and append to list
+                frames.append(pil2tensor(Image.fromarray(frame)))
+            else:
+                break
+
+        video.release()
+
+        return frames
+
+    def load(self, video: str, frame_start=0, frame_limit=16):
+        video_path = folder_paths.get_annotated_filepath(video)
+        (_, ext) = os.path.splitext(video_path)
+
+        if ext.lower() in {".gif", ".webp"}:
+            frames = self.load_gif(video_path, frame_start, frame_limit)
+        elif ext.lower() in {".webp", ".mp4", ".mov", ".avi"}:
+            frames = self.load_video(video_path, frame_start, frame_limit)
+        else:
+            raise ValueError(f"Unsupported video format: {ext}")
+
+        return (torch.cat(frames, dim=0),)
+
+    @classmethod
+    def IS_CHANGED(s, image, *args, **kwargs):
+        image_path = folder_paths.get_annotated_filepath(image)
+        m = hashlib.sha256()
+        with open(image_path, "rb") as f:
+            m.update(f.read())
+        return m.digest().hex()
+
+    @classmethod
+    def VALIDATE_INPUTS(s, video, *args, **kwargs):
+        if not folder_paths.exists_annotated_filepath(video):
+            return "Invalid video file: {}".format(video)
+
+        return True
+
+
+class ImageSizeAndBatchSize:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+            },
+        }
+
+    CATEGORY = "Animate Diff/Utils"
+    RETURN_TYPES = ("INT", "INT", "INT")
+    RETURN_NAMES = ("width", "height", "batch_size")
+    FUNCTION = "batch_size"
+
+    def batch_size(self, image: Tensor):
+        (batch_size, height, width) = image.shape[0:3]
+        return (width, height, batch_size)
+
+
+class ImageChunking:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "chunk_size": ("INT", {"default": 16, "min": 1, "max": 1024, "step": 1}),
+                "allow_remainder": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    CATEGORY = "Animate Diff/Utils"
+    RETURN_TYPES = ("IMAGE",)
+    OUTPUT_IS_LIST = (True,)
+    FUNCTION = "chunk"
+
+    def chunk(self, images: Tensor, chunk_size: int, allow_remainder: bool):
+        # Check if tensor is divisible into chunks of chunk_size
+        if images.shape[0] % chunk_size != 0 and not allow_remainder:
+            raise ValueError("Tensor's first dimension is not divisible by chunk size")
+
+        # Use torch.chunk to divide the tensor
+        chunk_count = images.shape[0] // chunk_size + images.shape[0] % chunk_size
+
+        print("chunk_count", chunk_count)
+        chunks = torch.chunk(images, chunk_count, dim=0)
+
+        return (list(chunks),)
 
 
 NODE_CLASS_MAPPINGS = {
-    "AnimateDiffLoader": AnimateDiffLoaderLegacy,
-    "AnimateDiffLoader_v2": AnimateDiffLoader,
-    "AnimateDiffUnload": AnimateDiffUnload,
+    "AnimateDiffModuleLoader": AnimateDiffModuleLoader,
     "AnimateDiffCombine": AnimateDiffCombine,
+    "AnimateDiffSampler": AnimateDiffSampler,
+    "AnimateDiffSlidingWindowOptions": AnimateDiffSlidingWindowOptions,
+    "LoadVideo": LoadVideo,
+    "ImageSizeAndBatchSize": ImageSizeAndBatchSize,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "AnimateDiffLoader": "[DEPRECATED] Animate Diff Loader Legacy",
-    "AnimateDiffLoader_v2": "Animate Diff Loader",
-    "AnimateDiffUnload": "Animate Diff Unload",
+    "AnimateDiffModuleLoader": "Animate Diff Module Loader",
+    "AnimateDiffSampler": "Animate Diff Sampler",
+    "AnimateDiffSlidingWindowOptions": "Sliding Window Options",
     "AnimateDiffCombine": "Animate Diff Combine",
+    "LoadVideo": "Load Video",
+    "ImageSizeAndBatchSize": "Get Image Size + Batch Size",
 }

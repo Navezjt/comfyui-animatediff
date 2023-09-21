@@ -1,14 +1,13 @@
-#このコードはhttps://github.com/kohya-ss/sd-scripts/blob/main/finetune/tag_images_by_wd14_tagger.pyを参考にしていますというかパクっています。
-
-from huggingface_hub import hf_hub_download
-import cv2
+import torch
 import numpy as np
-import os
-IMAGE_SIZE = 448
+from PIL import Image
 
-TAGGER_REPO = "furusu/wd-v1-4-tagger-pytorch"
-TAGGER_FILE = "wd-v1-4-vit-tagger-v2.ckpt"
+# Tensor to PIL
+def tensor2pil(image):
+    return Image.fromarray(
+        np.clip(255.0 * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8)
+    )
 
-def download(path):
-    if not os.path.exists(os.path.join(path, TAGGER_FILE)):
-        hf_hub_download(TAGGER_REPO, TAGGER_FILE, cache_dir=path, force_download=True, force_filename=TAGGER_FILE)
+# Convert PIL to Tensor
+def pil2tensor(image):
+    return torch.from_numpy(np.array(image).astype(np.float32) / 255.0).unsqueeze(0)

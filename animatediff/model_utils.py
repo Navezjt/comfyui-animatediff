@@ -1,28 +1,56 @@
 import os
-from huggingface_hub import hf_hub_download
+import hashlib
+from typing import Dict
+
+import folder_paths
+import comfy.model_management as model_management
+from comfy.utils import load_torch_file, calculate_parameters
+
+from .logger import logger
+from .motion_module import MotionWrapper
 
 
-HF_REPO = "guoyww/animatediff"
-MODEL_FILES = ["mm_sd_v14.ckpt", "mm_sd_v15.ckpt"]
+motion_modules: Dict[str, MotionWrapper] = {}
 
-CURRENT_DIR = os.path.dirname(os.path.realpath(__file__))
-MODEL_DIR = os.path.abspath(os.path.join(CURRENT_DIR, "../models"))
+
+folder_paths.folder_names_and_paths["AnimateDiff"] = (
+    [
+        os.path.join(folder_paths.models_dir, "AnimateDiff"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models"),
+    ],
+    folder_paths.supported_pt_extensions,
+)
 
 
 def get_available_models():
-    available_model = [
-        f for f in MODEL_FILES if os.path.exists(os.path.join(MODEL_DIR, f))
-    ]
-
-    return available_model
+    return folder_paths.get_filename_list("AnimateDiff")
 
 
-def download(model_file=MODEL_FILES[-1]):
-    if not os.path.exists(os.path.join(MODEL_DIR, model_file)):
-        hf_hub_download(
-            HF_REPO,
-            model_file,
-            cache_dir=MODEL_DIR,
-            force_download=True,
-            force_filename=model_file,
-        )
+def get_model_path(model_name):
+    return folder_paths.get_full_path("AnimateDiff", model_name)
+
+
+def get_model_hash(file_path):
+    with open(file_path, "rb") as f:
+        bytes = f.read()  # read entire file as bytes
+        return hashlib.sha256(bytes).hexdigest()
+
+
+def load_motion_module(model_name: str):
+    model_path = get_model_path(model_name)
+    model_hash = get_model_hash(model_path)
+    if model_hash not in motion_modules:
+        logger.info(f"Loading motion module {model_name}")
+        mm_state_dict = load_torch_file(model_path)
+        motion_module = MotionWrapper.from_state_dict(mm_state_dict, model_name)
+
+        params = calculate_parameters(mm_state_dict, "")
+        if model_management.should_use_fp16(model_params=params):
+            logger.info(f"Converting motion module to fp16.")
+            motion_module.half()
+        offload_device = model_management.unet_offload_device()
+        motion_module = motion_module.to(offload_device)
+
+        motion_modules[model_hash] = motion_module
+
+    return motion_modules[model_hash]
