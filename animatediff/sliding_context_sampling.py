@@ -1,6 +1,7 @@
+import math
 import torch
 from torch import Tensor
-import math
+from typing import List, Dict
 
 import comfy.utils
 import comfy.sample
@@ -15,6 +16,10 @@ from .sliding_schedule import get_context_scheduler, ContextSchedules
 
 orig_comfy_sample = comfy.sample.sample
 orig_sampling_function = comfy_samplers.sampling_function
+
+
+def lcm(a, b):
+    return abs(a * b) // math.gcd(a, b)
 
 
 class SlidingContext:
@@ -70,47 +75,34 @@ def __sliding_sample_factory(ctx: SlidingContext):
 
             ctx.current_step = start_step + step + 1
 
-        try:
-            return orig_comfy_sample(model, *args, **kwargs, callback=callback)
-        except RuntimeError as e:
-            if str(e).startswith("CUDA error: invalid configuration argument"):
-                raise RuntimeError(
-                    f"An xformers bug was encountered in AnimateDiff - to run your workflow, \
-                                    disable xformers in ComfyUI using '--disable-xformers' startup argument."
-                )
-            raise
+        return orig_comfy_sample(model, *args, **kwargs, callback=callback)
 
-    def sampling_function(
-        model_function, x, timestep, uncond, cond, cond_scale, cond_concat=None, model_options={}, seed=None
-    ):
-        def get_area_and_mult(cond, x_in, cond_concat_in, timestep_in):
+    def sampling_function(model_function, x, timestep, uncond, cond, cond_scale, model_options={}, seed=None):
+        def get_area_and_mult(conds, x_in, timestep_in):
             area = (x_in.shape[2], x_in.shape[3], 0, 0)
             strength = 1.0
-            if "timestep_start" in cond[1]:
-                timestep_start = cond[1]["timestep_start"]
+
+            if "timestep_start" in conds:
+                timestep_start = conds["timestep_start"]
                 if timestep_in[0] > timestep_start:
                     return None
-            if "timestep_end" in cond[1]:
-                timestep_end = cond[1]["timestep_end"]
+            if "timestep_end" in conds:
+                timestep_end = conds["timestep_end"]
                 if timestep_in[0] < timestep_end:
                     return None
-            if "area" in cond[1]:
-                area = cond[1]["area"]
-            if "strength" in cond[1]:
-                strength = cond[1]["strength"]
-
-            adm_cond = None
-            if "adm_encoded" in cond[1]:
-                adm_cond = cond[1]["adm_encoded"]
+            if "area" in conds:
+                area = conds["area"]
+            if "strength" in conds:
+                strength = conds["strength"]
 
             input_x = x_in[:, :, area[2] : area[0] + area[2], area[3] : area[1] + area[3]]
-            if "mask" in cond[1]:
+            if "mask" in conds:
                 # Scale the mask to the size of the input
                 # The mask should have been resized as we began the sampling process
                 mask_strength = 1.0
-                if "mask_strength" in cond[1]:
-                    mask_strength = cond[1]["mask_strength"]
-                mask = cond[1]["mask"]
+                if "mask_strength" in conds:
+                    mask_strength = conds["mask_strength"]
+                mask = conds["mask"]
                 assert mask.shape[1] == x_in.shape[2]
                 assert mask.shape[2] == x_in.shape[3]
                 mask = mask[:, area[2] : area[0] + area[2], area[3] : area[1] + area[3]] * mask_strength
@@ -119,7 +111,7 @@ def __sliding_sample_factory(ctx: SlidingContext):
                 mask = torch.ones_like(input_x)
             mult = mask * strength
 
-            if "mask" not in cond[1]:
+            if "mask" not in conds:
                 rr = 8
                 if area[2] != 0:
                     for t in range(rr):
@@ -135,24 +127,17 @@ def __sliding_sample_factory(ctx: SlidingContext):
                         mult[:, :, :, area[1] - 1 - t : area[1] - t] *= (1.0 / rr) * (t + 1)
 
             conditionning = {}
-            conditionning["c_crossattn"] = cond[0]
-            if cond_concat_in is not None and len(cond_concat_in) > 0:
-                cropped = []
-                for x in cond_concat_in:
-                    cr = x[:, :, area[2] : area[0] + area[2], area[3] : area[1] + area[3]]
-                    cropped.append(cr)
-                conditionning["c_concat"] = torch.cat(cropped, dim=1)
-
-            if adm_cond is not None:
-                conditionning["c_adm"] = adm_cond
+            model_conds = conds["model_conds"]
+            for c in model_conds:
+                conditionning[c] = model_conds[c].process_cond(batch_size=x_in.shape[0], device=x_in.device, area=area)
 
             control = None
-            if "control" in cond[1]:
-                control = cond[1]["control"]
+            if "control" in conds:
+                control = conds["control"]
 
             patches = None
-            if "gligen" in cond[1]:
-                gligen = cond[1]["gligen"]
+            if "gligen" in conds:
+                gligen = conds["gligen"]
                 patches = {}
                 gligen_type = gligen[0]
                 gligen_model = gligen[1]
@@ -170,24 +155,8 @@ def __sliding_sample_factory(ctx: SlidingContext):
                 return True
             if c1.keys() != c2.keys():
                 return False
-            if "c_crossattn" in c1:
-                s1 = c1["c_crossattn"].shape
-                s2 = c2["c_crossattn"].shape
-                if s1 != s2:
-                    if s1[0] != s2[0] or s1[2] != s2[2]:  # these 2 cases should not happen
-                        return False
-
-                    mult_min = comfy_samplers.lcm(s1[1], s2[1])
-                    diff = mult_min // min(s1[1], s2[1])
-                    if (
-                        diff > 4
-                    ):  # arbitrary limit on the padding because it's probably going to impact performance negatively if it's too much
-                        return False
-            if "c_concat" in c1:
-                if c1["c_concat"].shape != c2["c_concat"].shape:
-                    return False
-            if "c_adm" in c1:
-                if c1["c_adm"].shape != c2["c_adm"].shape:
+            for k in c1:
+                if not c1[k].can_concat(c2[k]):
                     return False
             return True
 
@@ -216,36 +185,22 @@ def __sliding_sample_factory(ctx: SlidingContext):
             c_concat = []
             c_adm = []
             crossattn_max_len = 0
-            for x in c_list:
-                if "c_crossattn" in x:
-                    c = x["c_crossattn"]
-                    if crossattn_max_len == 0:
-                        crossattn_max_len = c.shape[1]
-                    else:
-                        crossattn_max_len = comfy_samplers.lcm(crossattn_max_len, c.shape[1])
-                    c_crossattn.append(c)
-                if "c_concat" in x:
-                    c_concat.append(x["c_concat"])
-                if "c_adm" in x:
-                    c_adm.append(x["c_adm"])
-            out = {}
-            c_crossattn_out = []
-            for c in c_crossattn:
-                if c.shape[1] < crossattn_max_len:
-                    c = c.repeat(1, crossattn_max_len // c.shape[1], 1)  # padding with repeat doesn't change result
-                c_crossattn_out.append(c)
 
-            if len(c_crossattn_out) > 0:
-                out["c_crossattn"] = torch.cat(c_crossattn_out)
-            if len(c_concat) > 0:
-                out["c_concat"] = torch.cat(c_concat)
-            if len(c_adm) > 0:
-                out["c_adm"] = torch.cat(c_adm)
+            temp = {}
+            for x in c_list:
+                for k in x:
+                    cur = temp.get(k, [])
+                    cur.append(x[k])
+                    temp[k] = cur
+
+            out = {}
+            for k in temp:
+                conds = temp[k]
+                out[k] = conds[0].concat(conds[1:])
+
             return out
 
-        def calc_cond_uncond_batch(
-            model_function, cond, uncond, x_in, timestep, max_total_area, cond_concat_in, model_options
-        ):
+        def calc_cond_uncond_batch(model_function, cond, uncond, x_in, timestep, max_total_area, model_options):
             out_cond = torch.zeros_like(x_in)
             out_count = torch.ones_like(x_in) / 100000.0
 
@@ -257,14 +212,14 @@ def __sliding_sample_factory(ctx: SlidingContext):
 
             to_run = []
             for x in cond:
-                p = get_area_and_mult(x, x_in, cond_concat_in, timestep)
+                p = get_area_and_mult(x, x_in, timestep)
                 if p is None:
                     continue
 
                 to_run += [(p, COND)]
             if uncond is not None:
                 for x in uncond:
-                    p = get_area_and_mult(x, x_in, cond_concat_in, timestep)
+                    p = get_area_and_mult(x, x_in, timestep)
                     if p is None:
                         continue
 
@@ -367,7 +322,7 @@ def __sliding_sample_factory(ctx: SlidingContext):
         # sliding_calc_cond_uncond_batch inspired by ashen's initial hack for 16-frame sliding context:
         # https://github.com/comfyanonymous/ComfyUI/compare/master...ashen-sensored:ComfyUI:master
         def sliding_calc_cond_uncond_batch(
-            model_function, cond, uncond, x_in, timestep, max_total_area, cond_concat_in, model_options
+            model_function, cond, uncond, x_in, timestep, max_total_area, model_options
         ):
             # figure out how input is split
             axes_factor = x.size(0) // ctx.video_length
@@ -384,37 +339,29 @@ def __sliding_sample_factory(ctx: SlidingContext):
                 control.full_latent_length = ctx.video_length
                 control.context_length = ctx.context_length
 
-            def get_resized_cond(cond_in, full_idxs) -> list:
+            def get_resized_cond(cond_in: List[Dict], full_idxs) -> list:
                 # reuse or resize cond items to match context requirements
                 resized_cond = []
                 # cond object is a list containing a list - outer list is irrelevant, so just loop through it
                 for actual_cond in cond_in:
-                    resized_actual_cond = []
-                    # now we are in the inner list - index 0 is tensor, index 1 is dictionary
-                    for cond_idx, cond_item in enumerate(actual_cond):
+                    new_cond_item = actual_cond.copy()
+                    for key, cond_item in new_cond_item.items():
                         if isinstance(cond_item, Tensor):
                             # check that tensor is the expected length - x.size(0)
                             if cond_item.size(0) == x.size(0):
-                                pass
                                 # if so, it's subsetting time - tell controls the expected indeces so they can handle them
                                 actual_cond_item = cond_item[full_idxs]
-                                resized_actual_cond.append(actual_cond_item)
+                                new_cond_item[key] = actual_cond_item
+                        elif key == "control":
+                            control_item = cond_item
+                            if hasattr(control_item, "sub_idxs"):
+                                prepare_control_objects(control_item, full_idxs)
                             else:
-                                resized_actual_cond.append(cond_item)
-                        elif isinstance(cond_item, dict):
-                            # when in dictionary, look for control
-                            if "control" in cond_item:
-                                control_item = cond_item["control"]
-                                if hasattr(control_item, "sub_idxs"):
-                                    prepare_control_objects(control_item, full_idxs)
-                                else:
-                                    raise ValueError(
-                                        f"Control type {type(control_item).__name__} may not support required features for sliding context window; use Control objects from Kosinkadink/Advanced-ControlNet nodes."
-                                    )
-                            resized_actual_cond.append(cond_item)
-                        else:
-                            resized_actual_cond.append(cond_item)
-                    resized_cond.append(resized_actual_cond)
+                                raise ValueError(
+                                    f"Control type {type(control_item).__name__} may not support required features for sliding context window; use Control objects from Kosinkadink/Advanced-ControlNet nodes."
+                                )
+                            new_cond_item[key] = cond_item
+                    resized_cond.append(new_cond_item)
                 return resized_cond
 
             # perform calc_cond_uncond_batch per context window
@@ -437,7 +384,6 @@ def __sliding_sample_factory(ctx: SlidingContext):
                 sub_timestep = timestep[full_idxs]
                 sub_cond = get_resized_cond(cond, full_idxs) if cond is not None else None
                 sub_uncond = get_resized_cond(uncond, full_idxs) if uncond is not None else None
-                sub_cond_concat = get_resized_cond(cond_concat, full_idxs) if cond_concat is not None else None
 
                 sub_cond_out, sub_uncond_out = calc_cond_uncond_batch(
                     model_function,
@@ -446,7 +392,6 @@ def __sliding_sample_factory(ctx: SlidingContext):
                     sub_x,
                     sub_timestep,
                     max_total_area,
-                    sub_cond_concat,
                     model_options,
                 )
 
@@ -464,7 +409,7 @@ def __sliding_sample_factory(ctx: SlidingContext):
             uncond = None
 
         cond, uncond = sliding_calc_cond_uncond_batch(
-            model_function, cond, uncond, x, timestep, max_total_area, cond_concat, model_options
+            model_function, cond, uncond, x, timestep, max_total_area, model_options
         )
 
         if "sampler_cfg_function" in model_options:
@@ -477,6 +422,10 @@ def __sliding_sample_factory(ctx: SlidingContext):
 
 
 def inject_sampling_function(ctx: SlidingContext):
+    global orig_comfy_sample, orig_sampling_function
+    orig_comfy_sample = comfy.sample.sample
+    orig_sampling_function = comfy_samplers.sampling_function
+
     (sample, sampling_function) = __sliding_sample_factory(ctx)
     comfy.sample.sample = sample
     comfy_samplers.sampling_function = sampling_function
